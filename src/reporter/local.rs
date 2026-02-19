@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::SecondsFormat;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
 
@@ -61,18 +61,22 @@ impl LocalReporter {
         }
     }
 
+    fn jfr_file_name() -> String {
+        let time: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
+        let time = time
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+            .replace(":", "-");
+        format!("{time}.jfr")
+    }
+
     /// Writes the jfr file to disk.
     async fn report_profiling_data(
         &self,
         jfr: Vec<u8>,
         _metadata_obj: &ReportMetadata<'_>,
     ) -> Result<(), std::io::Error> {
-        let time: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
-        let time = time
-            .to_rfc3339_opts(SecondsFormat::Secs, true)
-            .replace(":", "-");
-        tracing::debug!("reporting {time}.jfr");
-        let file_name = format!("{time}.jfr");
+        let file_name = Self::jfr_file_name();
+        tracing::debug!("reporting {file_name}");
         tokio::fs::write(self.directory.join(file_name), jfr).await?;
         Ok(())
     }
@@ -87,6 +91,18 @@ impl Reporter for LocalReporter {
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
         self.report_profiling_data(jfr, metadata)
             .await
+            .map_err(|e| Box::new(LocalReporterError::IoError(e)) as _)
+    }
+
+    fn report_blocking(
+        &self,
+        jfr_path: &Path,
+        _metadata: &ReportMetadata,
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let file_name = Self::jfr_file_name();
+        tracing::debug!("reporting {file_name} (blocking)");
+        std::fs::copy(jfr_path, self.directory.join(file_name))
+            .map(|_| ())
             .map_err(|e| Box::new(LocalReporterError::IoError(e)) as _)
     }
 }
@@ -119,5 +135,26 @@ mod test {
             .next()
             .unwrap();
         assert_eq!(tokio::fs::read(jfr_file.path()).await.unwrap(), b"JFR");
+    }
+
+    #[test]
+    fn test_local_reporter_reports_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("input.jfr");
+        std::fs::write(&src, b"JFR-DROP").unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let reporter = LocalReporter::new(out_dir.path());
+        reporter.report_blocking(&src, &DUMMY_METADATA).unwrap();
+        let jfr_file = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .flat_map(|f| f.ok())
+            .filter(|f| {
+                Path::new(&f.file_name())
+                    .extension()
+                    .is_some_and(|e| e == "jfr")
+            })
+            .next()
+            .unwrap();
+        assert_eq!(std::fs::read(jfr_file.path()).unwrap(), b"JFR-DROP");
     }
 }
